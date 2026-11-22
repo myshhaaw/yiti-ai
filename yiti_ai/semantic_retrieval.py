@@ -24,7 +24,7 @@ MODEL_DIMENSION = 384
 SCHEMA_VERSION = 1
 SEMANTIC_DIR = ROOT / ".cache" / "semantic"
 MODEL_PATH_FILE = SEMANTIC_DIR / "model_snapshot.txt"
-DEFAULT_VECTOR_PATH = SEMANTIC_DIR / "policy-vectors.npz"
+DEFAULT_VECTOR_PATH = Path(os.environ.get("YITI_SEMANTIC_INDEX", str(SEMANTIC_DIR / "policy-vectors.npz")))
 BOILERPLATE_LINE = re.compile(
     r"^(?:BENNETT\s+UNIVERSITY|THE\s+TIMES\s+GROUP|A\s+TIMES\s+GROUP\s+INITIATIVE|"
     r"PAGE\s+\d+(?:\s+OF\s+\d+)?|\d+\s*/\s*\d+)\s*$",
@@ -134,7 +134,8 @@ def build_semantic_index(db_path: str | Path, output_path: str | Path = DEFAULT_
         "schema_version": SCHEMA_VERSION,
         "model_id": MODEL_ID,
         "dimension": MODEL_DIMENSION,
-        "source_index": str(Path(db_path).expanduser().resolve()),
+        # Store a portable basename, not a machine-specific absolute path.
+        "source_index": Path(db_path).name,
         "source_fingerprint": records_fingerprint(records),
         "record_count": len(records),
         "records": metadata_records,
@@ -170,7 +171,7 @@ class SemanticIndex:
         self.records = self.metadata.get("records") or []
         if self.vectors.shape != (len(self.records), MODEL_DIMENSION):
             raise SemanticIndexError("local semantic vector index metadata does not match its vectors")
-        if expected_db_path and Path(self.metadata.get("source_index", "")).resolve() != Path(expected_db_path).resolve():
+        if expected_db_path and Path(self.metadata.get("source_index", "")).name != Path(expected_db_path).name:
             raise SemanticIndexError("semantic vectors were built from a different SQLite index")
         if expected_db_path:
             current_records = eligible_records(expected_db_path)

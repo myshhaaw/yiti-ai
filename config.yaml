@@ -1,0 +1,16 @@
+# Minimal configuration used by the grounded Yiti policy chat.
+provider:
+  name: gemini
+  chat_model: gemini-3.5-flash-lite
+  embed_model: local-multilingual-e5-small
+  api_key_env: GEMINI_API_KEY
+  temperature: 0
+  reasoning_effort: null
+  chat_requests_per_minute: 10
+  chat_requests_per_day: 100
+  embed_requests_per_minute: 10
+  embed_requests_per_day: 100
+providers: {}
+knn: {k: 7}
+confidence: {w_agree: 0.5, w_share: 0.5}
+thresholds: {t_high: 0.7, t_low: 0.4}
