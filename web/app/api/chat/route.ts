@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
 import { evidenceStatus, loadPolicyIndex, searchPolicyIndex, type RetrievedEvidence } from "@/lib/policy-search";
-import { generateGroundedAnswer, GeminiError } from "@/lib/gemini";
+import { generateGroundedAnswerStream, GeminiError, hasValidCitationReferences } from "@/lib/gemini";
 
 export const runtime = "nodejs";
-export const maxDuration = 10;
+// 60 seconds is within Hobby's configured ceiling even when Fluid Compute is off.
+export const maxDuration = 60;
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_MESSAGE_LENGTH = 1_000;
@@ -87,6 +88,7 @@ function generationWarning(error: unknown): string {
   if (error.category === "gemini_request_failed" && error.httpStatus === 404) return "Gemini returned HTTP 404 model_or_endpoint_not_found; retrieved passages are shown below.";
   if (error.category === "gemini_request_failed" && error.httpStatus === 429) return "Gemini rate limit reached; retrieved passages are shown below.";
   if (error.category === "gemini_request_failed" && (error.httpStatus === 401 || error.httpStatus === 403)) return "Gemini authorization failed; retrieved passages are shown below.";
+  if (error.category === "gemini_invalid_citation") return "Gemini returned a citation outside the supplied evidence; retrieved passages are shown below.";
   return "Gemini generation failed; retrieved passages are shown below.";
 }
 
@@ -94,6 +96,10 @@ function retrievalOnlyAnswer(results: RetrievedEvidence[]): string {
   return results.length
     ? "I found relevant policy passages. Please review the linked citations for the supported details."
     : "I couldn't find a reliable matching policy passage. Please rephrase or contact the relevant campus office.";
+}
+
+function sseEvent(encoder: TextEncoder, event: string, data: object): Uint8Array {
+  return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 export async function POST(request: Request) {
@@ -154,27 +160,101 @@ export async function POST(request: Request) {
     });
   }
 
-  let answer = detailOnlyAnswer(verified.status, verified.requested_detail) || retrievalOnlyAnswer(results);
-  let answerMode: "gemini" | "retrieval" = "retrieval";
-  let warning: string | null = null;
-  // Do not ask the model to supply a concrete requested value when the retrieved
-  // evidence does not contain one. This is the missing-detail guard.
-  if (!detailOnlyAnswer(verified.status, verified.requested_detail) && process.env.GEMINI_API_KEY) {
-    try {
-      answer = await generateGroundedAnswer(message, history, results, process.env.GEMINI_API_KEY);
-      answerMode = "gemini";
-    } catch (error) {
-      warning = generationWarning(error);
-    }
-  } else if (!process.env.GEMINI_API_KEY) {
-    warning = "Gemini is not configured; retrieved passages are shown below.";
-  }
-
-  return response({
-    message, status: "evidence_found", answer, departments,
-    citations: results.slice(0, 8).map((item) => item.citation),
-    evidence: results.slice(0, 8), evidence_status: verified.status,
+  const citations = results.slice(0, 8).map((item) => item.citation);
+  const evidence = results.slice(0, 8);
+  const detailFallback = detailOnlyAnswer(verified.status, verified.requested_detail);
+  const commonReply = {
+    message, status: "evidence_found", departments,
+    citations, evidence, evidence_status: verified.status,
     requested_detail: verified.requested_detail,
-    retrieval_method: "keyword", answer_mode: answerMode, generation_warning: warning,
+    retrieval_method: "keyword" as const,
+  };
+
+  // Keep the evidence-missing guard ahead of Gemini. Never ask the model to
+  // invent a requested clock time, amount, date, deadline, or duration.
+  if (detailFallback) return response({
+    ...commonReply, answer: detailFallback, answer_mode: "retrieval", generation_warning: null,
+  });
+  if (!process.env.GEMINI_API_KEY) return response({
+    ...commonReply, answer: retrievalOnlyAnswer(results), answer_mode: "retrieval",
+    generation_warning: "Gemini is not configured; retrieved passages are shown below.",
+  });
+
+  const encoder = new TextEncoder();
+  const routeAbort = new AbortController();
+  let cancelled = false;
+  const onRequestAbort = () => { cancelled = true; routeAbort.abort(); };
+  request.signal.addEventListener("abort", onRequestAbort, { once: true });
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const emit = (event: string, data: object) => {
+        if (!cancelled) controller.enqueue(sseEvent(encoder, event, data));
+      };
+      emit("start", { ...commonReply, answer: "", answer_mode: "gemini", generation_warning: null });
+      void (async () => {
+        let answer = "";
+        let pendingCitation = "";
+        const emitVerifiedText = (text: string) => {
+          pendingCitation += text;
+          while (pendingCitation) {
+            const open = pendingCitation.indexOf("[");
+            if (open < 0) {
+              emit("delta", { text: pendingCitation });
+              pendingCitation = "";
+              return;
+            }
+            if (open > 0) {
+              emit("delta", { text: pendingCitation.slice(0, open) });
+              pendingCitation = pendingCitation.slice(open);
+            }
+            const close = pendingCitation.indexOf("]");
+            if (close < 0) return;
+            const marker = pendingCitation.slice(0, close + 1);
+            if (!/^\[\d+\]$/.test(marker) || !hasValidCitationReferences(marker, Math.min(5, results.length))) {
+              throw new GeminiError("gemini_invalid_citation");
+            }
+            emit("delta", { text: marker });
+            pendingCitation = pendingCitation.slice(close + 1);
+          }
+        };
+        try {
+          for await (const token of generateGroundedAnswerStream(message, history, results, { signal: routeAbort.signal })) {
+            if (cancelled) return;
+            answer += token;
+            emitVerifiedText(token);
+          }
+          if (pendingCitation || !hasValidCitationReferences(answer, Math.min(5, results.length))) {
+            throw new GeminiError("gemini_invalid_citation");
+          }
+          emit("done", { answer_mode: "gemini" });
+        } catch (error) {
+          if (cancelled) return;
+          emit("fallback", {
+            ...commonReply,
+            answer: retrievalOnlyAnswer(results),
+            answer_mode: "retrieval",
+            generation_warning: generationWarning(error),
+          });
+          emit("done", { answer_mode: "retrieval" });
+        } finally {
+          request.signal.removeEventListener("abort", onRequestAbort);
+          if (!cancelled) controller.close();
+        }
+      })();
+    },
+    cancel() {
+      cancelled = true;
+      routeAbort.abort();
+      request.signal.removeEventListener("abort", onRequestAbort);
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
   });
 }

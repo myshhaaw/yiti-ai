@@ -1,7 +1,8 @@
 import type { RetrievedEvidence } from "./policy-search";
 
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
-const TIMEOUT_MS = 7_000;
+const DEFAULT_TIMEOUT_MS = 45_000;
+const MAX_TIMEOUT_MS = 55_000;
 
 export class GeminiError extends Error {
   readonly category: string;
@@ -15,16 +16,33 @@ export class GeminiError extends Error {
   }
 }
 
-export async function generateGroundedAnswer(
+export function getGeminiTimeoutMs(value = process.env.YITI_GEMINI_TIMEOUT_MS): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1_000) return DEFAULT_TIMEOUT_MS;
+  return Math.min(Math.floor(parsed), MAX_TIMEOUT_MS);
+}
+
+export function hasValidCitationReferences(answer: string, evidenceCount: number): boolean {
+  const suppliedSources = Math.min(5, evidenceCount);
+  for (const match of answer.matchAll(/\[(\d+)\]/g)) {
+    const citationNumber = Number(match[1]);
+    if (!Number.isInteger(citationNumber) || citationNumber < 1 || citationNumber > suppliedSources) return false;
+  }
+  return true;
+}
+
+type StreamOptions = {
+  apiKey?: string;
+  fetcher?: typeof fetch;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+};
+
+function requestContents(
   message: string,
   history: Array<{ role: "user" | "assistant"; content: string }>,
   evidence: RetrievedEvidence[],
-  apiKey = process.env.GEMINI_API_KEY,
-  fetcher: typeof fetch = fetch,
-): Promise<string> {
-  if (!apiKey) throw new GeminiError("gemini_not_configured");
-  if (!evidence.length) throw new GeminiError("grounded_evidence_required");
-
+) {
   const evidenceText = evidence.slice(0, 5).map((item, index) =>
     `[${index + 1}] Department: ${item.citation.department}\n` +
     `Source: ${item.citation.label}\n` +
@@ -41,38 +59,109 @@ export async function generateGroundedAnswer(
     parts: [{ text: `Question: ${message}\n\nRetrieved policy evidence:\n${evidenceText}` }],
   });
 
+  return {
+    systemInstruction: {
+      parts: [{ text: "You are Yiti AI, a Bennett University policy assistant. Answer only from the supplied retrieved policy passages. Do not use general knowledge to fill gaps or invent policies. If a requested time, amount, date, deadline, or duration is absent, say that the passage does not state it. For multi-topic questions, answer each supported topic separately. Use concise natural English and understand Hinglish. Add inline citations like [1] that refer only to the supplied passage numbers. Never claim a passage says more than it does." }],
+    },
+    contents,
+    generationConfig: { temperature: 0, maxOutputTokens: 450 },
+  };
+}
+
+function textParts(data: unknown): string[] {
+  if (!data || typeof data !== "object") return [];
+  const candidates = (data as { candidates?: Array<{ content?: { parts?: Array<{ text?: unknown }> } }> }).candidates;
+  const parts = candidates?.[0]?.content?.parts ?? [];
+  return parts.flatMap((part) => typeof part.text === "string" && part.text ? [part.text] : []);
+}
+
+function parseSseData(block: string): string | null {
+  const data = block.split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n");
+  return data && data !== "[DONE]" ? data : null;
+}
+
+function extractSseBlock(buffer: string): { block: string; rest: string } | null {
+  const match = /\r?\n\r?\n/.exec(buffer);
+  if (!match || match.index === undefined) return null;
+  return {
+    block: buffer.slice(0, match.index),
+    rest: buffer.slice(match.index + match[0].length),
+  };
+}
+
+export async function* generateGroundedAnswerStream(
+  message: string,
+  history: Array<{ role: "user" | "assistant"; content: string }>,
+  evidence: RetrievedEvidence[],
+  options: StreamOptions = {},
+): AsyncGenerator<string> {
+  const apiKey = options.apiKey ?? process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new GeminiError("gemini_not_configured");
+  if (!evidence.length) throw new GeminiError("grounded_evidence_required");
+
+  const fetcher = options.fetcher ?? fetch;
+  const timeoutMs = options.timeoutMs ?? getGeminiTimeoutMs();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const onParentAbort = () => controller.abort();
+  if (options.signal?.aborted) controller.abort();
+  else options.signal?.addEventListener("abort", onParentAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     const response = await fetcher(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:streamGenerateContent?alt=sse`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: "You are Yiti AI, a Bennett University policy assistant. Answer only from the supplied retrieved policy passages. Do not use general knowledge to fill gaps or invent policies. If a requested time, amount, date, deadline, or duration is absent, say that the passage does not state it. For multi-topic questions, answer each supported topic separately. Use concise natural English and understand Hinglish. Add inline citations like [1] that match the supplied passage numbers. Never claim a passage says more than it does." }],
-          },
-          contents,
-          generationConfig: { temperature: 0, maxOutputTokens: 450 },
-        }),
+        body: JSON.stringify(requestContents(message, history, evidence)),
         signal: controller.signal,
         cache: "no-store",
       },
     );
 
     if (!response.ok) throw new GeminiError("gemini_request_failed", response.status);
-    const data = await response.json() as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    if (!response.body) throw new GeminiError("gemini_stream_missing_body");
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let sawText = false;
+    const consumeBlock = function* (block: string): Generator<string> {
+      const data = parseSseData(block);
+      if (!data) return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        throw new GeminiError("gemini_stream_invalid_event");
+      }
+      for (const text of textParts(parsed)) {
+        sawText = true;
+        yield text;
+      }
     };
-    const answer = data.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim();
-    if (!answer) throw new GeminiError("gemini_returned_no_text");
-    return answer;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      let extracted: { block: string; rest: string } | null;
+      while ((extracted = extractSseBlock(buffer))) {
+        buffer = extracted.rest;
+        yield* consumeBlock(extracted.block);
+      }
+      if (done) break;
+    }
+    if (buffer.trim()) yield* consumeBlock(buffer);
+    if (!sawText) throw new GeminiError("gemini_returned_no_text");
   } catch (error) {
-    if (error instanceof GeminiError) throw error;
     if (controller.signal.aborted) throw new GeminiError("gemini_timeout");
+    if (error instanceof GeminiError) throw error;
     throw new GeminiError("gemini_network_error");
   } finally {
     clearTimeout(timer);
+    options.signal?.removeEventListener("abort", onParentAbort);
   }
 }

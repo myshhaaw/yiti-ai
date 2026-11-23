@@ -32,13 +32,84 @@ export default function Home() {
 
   async function send(text: string) {
     const question = text.trim(); if (!question || busy) return;
-    setMessages(old => [...old, { role: "student", text: question }]); setDraft(""); setError(""); setBusy(true);
+    const assistantIndex = messages.length + 1;
+    setMessages(old => [...old, { role: "student", text: question }, { role: "yiti", text: "" }]); setDraft(""); setError(""); setBusy(true);
     try {
       const history=messages.slice(-6).map(m=>({role:m.role==="student"?"user":"assistant",content:m.text}));
       const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: question, history }) });
-      const body = await res.json(); if (!res.ok && res.status !== 503) throw new Error(body.detail || "The request failed. Please try again.");
-      setMessages(old => [...old, { role: "yiti", text: body.answer, reply: body }]);
-    } catch (e) { setError(e instanceof Error ? e.message : "Could not reach Yiti AI."); }
+      if (!res.ok && res.status !== 503) {
+        const body = await res.json();
+        throw new Error(body.detail || "The request failed. Please try again.");
+      }
+
+      if (res.headers.get("content-type")?.includes("text/event-stream") && res.body) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let answer = "";
+        let streamStarted = false;
+
+        const updateAssistant = (textValue: string, reply?: ChatReply, append = false) => {
+          setMessages(old => {
+            if (old[assistantIndex]?.role !== "yiti") return old;
+            const next = [...old];
+            next[assistantIndex] = {
+              ...next[assistantIndex],
+              text: append ? next[assistantIndex].text + textValue : textValue,
+              ...(reply ? { reply } : {}),
+            };
+            return next;
+          });
+        };
+
+        const handleBlock = (block: string) => {
+          let event = "message";
+          const dataLines: string[] = [];
+          for (const line of block.split(/\r?\n/)) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+          }
+          if (!dataLines.length) return;
+          const data = JSON.parse(dataLines.join("\n")) as ChatReply & { text?: string };
+          if (event === "start") {
+            streamStarted = true;
+            updateAssistant("", data as ChatReply);
+          } else if (event === "delta" && typeof data.text === "string") {
+            answer += data.text;
+            updateAssistant(data.text, undefined, true);
+          } else if (event === "fallback") {
+            answer = data.answer;
+            updateAssistant(data.answer, data as ChatReply);
+          }
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          buffer += decoder.decode(value, { stream: !done });
+          let boundary = /\r?\n\r?\n/.exec(buffer);
+          while (boundary && boundary.index !== undefined) {
+            handleBlock(buffer.slice(0, boundary.index));
+            buffer = buffer.slice(boundary.index + boundary[0].length);
+            boundary = /\r?\n\r?\n/.exec(buffer);
+          }
+          if (done) break;
+        }
+        if (buffer.trim()) handleBlock(buffer);
+        if (!streamStarted) throw new Error("The chat stream ended before Yiti received a response.");
+      } else {
+        const body = await res.json();
+        setMessages(old => {
+          const next = [...old];
+          next[assistantIndex] = { role: "yiti", text: body.answer, reply: body };
+          return next;
+        });
+      }
+    } catch (e) {
+      setMessages(old => old[assistantIndex]?.role === "yiti" && !old[assistantIndex].text
+        ? old.filter((_, index) => index !== assistantIndex)
+        : old);
+      setError(e instanceof Error ? e.message : "Could not reach Yiti AI.");
+    }
     finally { setBusy(false); }
   }
   function submit(e: FormEvent) { e.preventDefault(); void send(draft); }
@@ -47,7 +118,7 @@ export default function Home() {
     <section className="main"><header><div className="crumb">Campus guide <span>/</span> Ask Yiti</div><div className="header-right"><span className={`status ${health === "Backend offline" ? "offline" : ""}`}><i/> {health}</span><span className="help" title="Questions can be in English or Hinglish">English / Hinglish</span></div></header>
       <div className="content"><div className="intro"><div className="eyebrow"><span>✦</span> YOUR CAMPUS COMPANION</div><h1>Hi there. What can<br/>I help you <em>figure out?</em></h1><p>Ask about policies, academics, hostel life, fees, and more.<br/>Try English or Hinglish — I’ll help you find the right source.</p></div>
         <div className="chat">
-          {messages.length === 0 ? <><div className="suggest-label">A FEW THINGS YOU CAN ASK</div><div className="suggestions">{examples.map((q,i)=><button key={q} onClick={() => void send(q)}><span>{["₹","⌁","▤","⌂"][i]}</span>{q}<b>↗</b></button>)}</div></> : <div className="thread">{messages.map((m,i)=><div key={i} className={`message ${m.role}`}><div className="message-icon">{m.role === "student" ? "S" : "Y"}</div><div className="bubble"><div className="role-label">{m.role === "student" ? "YOU" : m.reply?.answer_mode === "gemini" ? "YITI AI · GEMINI ANSWER" : "YITI AI · RETRIEVED POLICY EVIDENCE"}</div><p>{m.text}</p>{m.reply && <div className={`evidence-status evidence-${m.reply.evidence_status || "unknown"}`}>{evidenceStatusLabel(m.reply)}{m.reply.retrieval_method && <span> · {m.reply.retrieval_method.replaceAll("_", " ")}</span>}</div>}{m.reply?.answer_mode !== "gemini" && m.reply?.generation_warning && <div className="fallback-note">Retrieval only · {m.reply.generation_warning}</div>}{(m.reply?.citations?.length ?? 0) > 0 && <div className="inline-citations">Sources: {m.reply?.citations?.map((c,j)=><span key={`${c.file_path}-${c.page}-${j}`}>{j>0 ? ", " : ""}{c.source_url ? <a href={c.source_url} target="_blank" rel="noreferrer">[{j+1}]</a> : <span>[{j+1}]</span>}</span>)}</div>}{m.reply?.evidence.map((ev,j)=><article className="source" key={j}><div className="source-top"><span>{ev.citation.department.replaceAll("_"," ")}</span><span>{ev.retrieval_source?.replaceAll("+", " + ") || "keyword"} retrieval</span></div><h3>{ev.citation.title}</h3>{ev.citation.page && <small>Page {ev.citation.page}{ev.citation.heading ? ` · ${ev.citation.heading}` : ""}</small>}<blockquote>{ev.evidence}</blockquote>{ev.citation.source_url && <a href={ev.citation.source_url} target="_blank" rel="noreferrer">Open source ↗</a>}</article>)}</div></div>)}{busy && <div className="loading"><span/> Looking through campus policies…</div>}</div>}
+          {messages.length === 0 ? <><div className="suggest-label">A FEW THINGS YOU CAN ASK</div><div className="suggestions">{examples.map((q,i)=><button key={q} onClick={() => void send(q)}><span>{["₹","⌁","▤","⌂"][i]}</span>{q}<b>↗</b></button>)}</div></> : <div className="thread">{messages.map((m,i)=><div key={i} className={`message ${m.role}`}><div className="message-icon">{m.role === "student" ? "S" : "Y"}</div><div className="bubble"><div className="role-label">{m.role === "student" ? "YOU" : m.reply?.answer_mode === "gemini" ? "YITI AI · GEMINI ANSWER" : "YITI AI · RETRIEVED POLICY EVIDENCE"}</div><p>{m.text}</p>{m.reply && <div className={`evidence-status evidence-${m.reply.evidence_status || "unknown"}`}>{evidenceStatusLabel(m.reply)}{m.reply.retrieval_method && <span> · {m.reply.retrieval_method.replaceAll("_", " ")}</span>}</div>}{m.reply?.answer_mode !== "gemini" && m.reply?.generation_warning && <div className="fallback-note">Retrieval only · {m.reply.generation_warning}</div>}{(m.reply?.citations?.length ?? 0) > 0 && <div className="inline-citations">Sources: {m.reply?.citations?.map((c,j)=><span key={`${c.file_path}-${c.page}-${j}`}>{j>0 ? ", " : ""}{c.source_url ? <a href={c.source_url} target="_blank" rel="noreferrer">[{j+1}]</a> : <span>[{j+1}]</span>}</span>)}</div>}{m.reply?.evidence.map((ev,j)=><article className="source" key={j}><div className="source-top"><span>{ev.citation.department.replaceAll("_"," ")}</span><span>{ev.retrieval_source?.replaceAll("+", " + ") || "keyword"} retrieval</span></div><h3>{ev.citation.title}</h3>{ev.citation.page && <small>Page {ev.citation.page}{ev.citation.heading ? ` · ${ev.citation.heading}` : ""}</small>}<blockquote>{ev.evidence}</blockquote>{ev.citation.source_url && <a href={ev.citation.source_url} target="_blank" rel="noreferrer">Open source ↗</a>}</article>)}</div></div>)}{busy && <div className="loading"><span/> Searching policies and writing a grounded answer…</div>}</div>}
           {error && <div className="error">{error}</div>}
           <form className="composer" onSubmit={submit}><textarea value={draft} onChange={e=>setDraft(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();void send(draft)}}} placeholder="Ask a campus question… (English or Hinglish)" rows={2}/><div className="composer-foot"><span>↵ Enter to send · Shift + ↵ for a new line</span><button disabled={busy||!draft.trim()} aria-label="Send message">↑</button></div></form>
           <div className="disclaimer">Yiti AI finds relevant source passages. Always check the linked policy for complete and current details.</div>
