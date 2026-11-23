@@ -1,28 +1,45 @@
-# Deploy Yiti AI
+# Yiti AI on Vercel
 
-## Render FastAPI backend
+Yiti AI runs as one Next.js application. The same-origin `/api/chat` route uses a
+local BM25 index exported from the reviewed 24-document, 1,160-chunk SQLite
+index. Policy text remains out of the public source repository.
 
-Create a Docker Web Service from the GitHub repository and use the root-level
-render.yaml. It launches yiti_ai.api:app on 0.0.0.0:$PORT. Configure GEMINI_API_KEY
-as a Render secret and WEB_ORIGIN as the exact Vercel origin.
+## Provision the private policy index
 
-The SQLite and vector files are excluded from Git and Docker. The blueprint does
-not provision a disk or enable billing. Until storage is approved and configured,
-policy retrieval will be unavailable. The backend expects:
+From the repository root, export the verified production index:
 
-- YITI_LOCAL_INDEX=/var/data/search.sqlite3
-- YITI_SEMANTIC_INDEX=/var/data/policy-vectors.npz
+```powershell
+python tools/build_web_policy_index.py
+```
 
-## Vercel Next.js frontend
+The output is `web/.data/policy-index.json.gz` and is ignored by Git. Confirm
+the printed document/chunk counts and checksum. Upload only that compressed
+file to the approved **private** repository
+`myshhaaw/yiti-ai-policy-artifacts`, at its root as `policy-index.json.gz`.
+Keep the repository private and create a fine-grained read-only token scoped to
+that repository's Contents. The token is used only during Vercel's build and
+must never be committed or placed in a `NEXT_PUBLIC_` variable. The build
+downloads the file, verifies gzip/schema/counts and optional SHA-256, then
+includes it only in the server-side API function trace. The artifact is not a
+public static asset. Public chat answers intentionally show limited retrieved
+passages and source citations.
 
-Import the same repository, set Root Directory to web/, and use the detected
-Next.js build settings. Add NEXT_PUBLIC_YITI_API_URL with the Render service
-origin (no trailing slash). This is public URL configuration, not a secret.
-After Vercel assigns a URL, set Render WEB_ORIGIN to its exact https origin.
+## Vercel setup
 
-## Costs and data boundary
+Import `myshhaaw/yiti-ai` and set the Root Directory to `web`. Framework is
+Next.js; Build Command `npm run build`; Install Command `npm ci`. Add these
+server-side environment variables for Production (and Preview only if desired):
 
-The Render blueprint requests the Free plan and creates no persistent disk.
-No paid service has been enabled. The database and vector artifacts must not be
-uploaded until their contents, destination, public/private visibility, and
-storage cost have been reviewed and approved.
+- `GEMINI_API_KEY`: your Gemini key.
+- `GEMINI_MODEL`: `gemini-3.5-flash-lite`.
+- `YITI_POLICY_ARTIFACT_REPO`: `myshhaaw/yiti-ai-policy-artifacts`.
+- `YITI_POLICY_ARTIFACT_TOKEN`: fine-grained read-only token described above.
+- `YITI_POLICY_INDEX_SHA256`: SHA-256 printed by the export script.
+
+No `NEXT_PUBLIC_` variables are needed. Do not add Render services, persistent
+disks, paid storage, or billing. Stay on Vercel Hobby. If the free plan or
+Google API quota is unavailable for your account, stop rather than upgrading.
+
+The `/api/health` route reports whether the index and Gemini key are configured.
+It does not validate Gemini generation. `/api/chat` returns retrieval-only
+answers if Gemini is unavailable and refuses to invent missing requested facts.

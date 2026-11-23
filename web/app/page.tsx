@@ -21,24 +21,22 @@ export default function Home() {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [api, setApi] = useState(process.env.NEXT_PUBLIC_YITI_API_URL || "http://127.0.0.1:8000");
   const [health, setHealth] = useState("checking");
   const [historyLoaded, setHistoryLoaded] = useState(false);
   useEffect(() => {
-    setApi(window.localStorage.getItem("yiti-api") || process.env.NEXT_PUBLIC_YITI_API_URL || "http://127.0.0.1:8000");
     try { const saved=window.localStorage.getItem("yiti-current-chat"); if(saved) setMessages(JSON.parse(saved)); } catch { window.localStorage.removeItem("yiti-current-chat"); }
     setHistoryLoaded(true);
   }, []);
   useEffect(() => { if(historyLoaded) window.localStorage.setItem("yiti-current-chat",JSON.stringify(messages)); },[messages,historyLoaded]);
-  useEffect(() => { let alive=true; fetch(`${api}/health`).then(r => r.json()).then(h => { if(alive) setHealth(h.semantic_index?.available ? "Local hybrid policy library ready" : h.local_index?.available ? "Local keyword policy library ready" : `Backend online · ${h.error || "policy index unavailable"}`); }).catch(() => {if(alive)setHealth("Backend offline");}); return ()=>{alive=false}; }, [api]);
+  useEffect(() => { let alive=true; fetch("/api/health").then(r => r.json()).then(h => { if(alive) setHealth(h.local_index?.available ? "Policy library ready" : "Policy index unavailable"); }).catch(() => {if(alive)setHealth("Backend offline");}); return ()=>{alive=false}; }, []);
 
   async function send(text: string) {
     const question = text.trim(); if (!question || busy) return;
     setMessages(old => [...old, { role: "student", text: question }]); setDraft(""); setError(""); setBusy(true);
     try {
       const history=messages.slice(-6).map(m=>({role:m.role==="student"?"user":"assistant",content:m.text}));
-      const res = await fetch(`${api}/chat`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: question, history }) });
-      const body = await res.json(); if (!res.ok) throw new Error(body.detail || "The request failed. Check that the local Yiti API is running.");
+      const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: question, history }) });
+      const body = await res.json(); if (!res.ok && res.status !== 503) throw new Error(body.detail || "The request failed. Please try again.");
       setMessages(old => [...old, { role: "yiti", text: body.answer, reply: body }]);
     } catch (e) { setError(e instanceof Error ? e.message : "Could not reach Yiti AI."); }
     finally { setBusy(false); }
