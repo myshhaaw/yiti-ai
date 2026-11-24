@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const output = path.resolve(here, "..", ".data", "policy-index.json.gz");
-const token = process.env.YITI_POLICY_ARTIFACT_TOKEN;
-const repository = process.env.YITI_POLICY_ARTIFACT_REPO || "myshhaaw/yiti-ai-policy-artifacts";
+const token = process.env.YITI_POLICY_ARTIFACT_TOKEN?.trim();
+const repository = (process.env.YITI_POLICY_ARTIFACT_REPO || "myshhaaw/yiti-ai-policy-artifacts").trim();
 const expectedHash = process.env.YITI_POLICY_INDEX_SHA256?.trim().toLowerCase();
 
 function verify(buffer) {
@@ -20,6 +20,13 @@ function verify(buffer) {
     throw new Error("Policy artifact counts or schema do not match the reviewed index.");
   }
   return actualHash;
+}
+
+if (process.env.VERCEL && !expectedHash) {
+  throw new Error("Set YITI_POLICY_INDEX_SHA256 in Vercel to pin the reviewed policy artifact.");
+}
+if (expectedHash && !/^[a-f0-9]{64}$/.test(expectedHash)) {
+  throw new Error("YITI_POLICY_INDEX_SHA256 must be a 64-character hexadecimal SHA-256 value.");
 }
 
 if (!token) {
@@ -36,17 +43,46 @@ if (!token) {
 }
 
 if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw new Error("YITI_POLICY_ARTIFACT_REPO is invalid.");
-const apiUrl = `https://api.github.com/repos/${repository}/contents/policy-index.json.gz?ref=main`;
-const response = await fetch(apiUrl, {
-  headers: {
-    Authorization: `Bearer ${token}`,
-    Accept: "application/vnd.github.raw+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "yiti-ai-policy-index-build",
-  },
-  cache: "no-store",
-});
-if (!response.ok) throw new Error(`Private policy artifact fetch failed with HTTP ${response.status}.`);
+
+const apiBase = `https://api.github.com/repos/${repository}`;
+const headers = {
+  Authorization: `Bearer ${token}`,
+  Accept: "application/vnd.github+json",
+  "X-GitHub-Api-Version": "2022-11-28",
+  "User-Agent": "yiti-ai-policy-index-build",
+};
+
+async function githubFetch(url, accept = headers.Accept) {
+  try {
+    return await fetch(url, {
+      headers: { ...headers, Accept: accept },
+      cache: "no-store",
+    });
+  } catch {
+    throw new Error("GitHub API request failed due to network connectivity; check the build network and retry.");
+  }
+}
+
+function repositoryAccessError(status) {
+  if (status === 401) return "GitHub rejected YITI_POLICY_ARTIFACT_TOKEN (HTTP 401): the token is invalid or expired.";
+  if (status === 403) return "GitHub denied repository access (HTTP 403): the token lacks repository access or an organization policy blocks it.";
+  if (status === 404) return "GitHub returned HTTP 404 for repository metadata: verify YITI_POLICY_ARTIFACT_REPO and that the token can access this private repository.";
+  return `GitHub repository access check failed with HTTP ${status}.`;
+}
+
+const repositoryResponse = await githubFetch(apiBase);
+if (!repositoryResponse.ok) throw new Error(repositoryAccessError(repositoryResponse.status));
+const repositoryInfo = await repositoryResponse.json();
+if (repositoryInfo.private !== true) throw new Error("The policy artifact repository must be private.");
+
+const artifactUrl = `${apiBase}/contents/policy-index.json.gz?ref=main`;
+const response = await githubFetch(artifactUrl, "application/vnd.github.raw+json");
+if (!response.ok) {
+  if (response.status === 401) throw new Error("GitHub rejected YITI_POLICY_ARTIFACT_TOKEN (HTTP 401): the token is invalid or expired.");
+  if (response.status === 403) throw new Error("GitHub denied policy file access (HTTP 403): grant this token Contents: Read-only access to the private artifact repository.");
+  if (response.status === 404) throw new Error("GitHub returned HTTP 404 for main/policy-index.json.gz although repository metadata is accessible; verify the file path, main branch, and token Contents: Read-only permission.");
+  throw new Error(`Private policy artifact fetch failed with HTTP ${response.status}.`);
+}
 const buffer = Buffer.from(await response.arrayBuffer());
 if (buffer.length > 20 * 1024 * 1024) throw new Error("Policy artifact exceeds the 20 MB build limit.");
 const hash = verify(buffer);
