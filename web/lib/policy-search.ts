@@ -53,6 +53,8 @@ export type PolicySearchResult = {
   results: RetrievedEvidence[];
 };
 
+export type RoutedPolicyTopic = { query: string; department: string | null };
+
 const STOP_WORDS = new Set([
   "a", "an", "and", "are", "as", "at", "can", "do", "does", "for", "from", "how", "i", "in", "is",
   "it", "me", "my", "of", "on", "or", "please", "should", "the", "to", "what", "when", "where", "which", "who",
@@ -170,18 +172,34 @@ function departmentFamily(department: string | null): Array<string | null> {
   return [department];
 }
 
-function splitTopics(query: string): Array<{ query: string; department: string | null }> {
-  const clauses = query.split(/\b(?:and|aur|also)\b|[;]/i).map((part) => part.trim()).filter(Boolean);
+export function routePolicyQuestion(query: string, selectedDepartment?: string | null): RoutedPolicyTopic[] {
+  const normalized = normalizePolicyQuery(query);
+  const selected = departmentName(selectedDepartment);
+  if (selected) return [{ query: normalized, department: selected }];
+
+  const clauses = normalized.split(/\b(?:and|aur|also)\b|[;]/i).map((part) => part.trim()).filter(Boolean);
   if (clauses.length > 1) {
-    const clauseDepartments = clauses.map(identifyDepartments);
-    const allExplicit = clauseDepartments.every((found) => found.length > 0);
-    const differentDomains = new Set(clauseDepartments.flat()).size > 1;
-    if (allExplicit && differentDomains) {
-      return clauses.flatMap((part, index) => clauseDepartments[index].map((department) => ({ query: part, department })));
+    const routed: RoutedPolicyTopic[] = [];
+    let inheritedDepartment: string | null = null;
+    for (const clause of clauses) {
+      const found = identifyDepartments(clause);
+      if (found.length) {
+        inheritedDepartment = found[0];
+        routed.push(...found.map((department) => ({ query: clause, department })));
+      } else if (inheritedDepartment) {
+        // Carry the preceding topic's office through follow-up clauses such as
+        // "hostel rules and what happens if I return late".
+        routed.push({ query: clause, department: inheritedDepartment });
+      }
     }
+    const distinctDepartments = new Set(routed.map((topic) => topic.department));
+    if (routed.length > 1 && distinctDepartments.size > 1) return routed;
   }
-  const departments = identifyDepartments(query);
-  return departments.length ? departments.map((department) => ({ query, department })) : [{ query, department: null }];
+
+  const departments = identifyDepartments(normalized);
+  return departments.length
+    ? departments.map((department) => ({ query: normalized, department }))
+    : [{ query: normalized, department: null }];
 }
 
 function recordTokens(record: PolicyRecord): string[] {
@@ -266,18 +284,24 @@ function rankTopic(index: PolicyIndex, query: string, department: string | null,
 }
 
 export function searchPolicyIndex(index: PolicyIndex, query: string, department?: string | null): PolicySearchResult {
-  const searchQuery = normalizePolicyQuery(query);
-  const topics = department
-    ? [{ query: searchQuery, department: departmentName(department) }]
-    : splitTopics(searchQuery);
+  const topics = routePolicyQuestion(query, department);
   const merged = new Map<string, RetrievedEvidence>();
   for (const topic of topics) {
-    for (const result of rankTopic(index, topic.query, topic.department, 8)) {
-      const key = `${result.citation.document_id}:${result.citation.chunk_id}`;
-      const existing = merged.get(key);
-      if (existing) existing.score += result.score;
-      else merged.set(key, result);
+    const scoped = rankTopic(index, topic.query, topic.department, topic.department ? 5 : 8);
+    const global = topic.department ? rankTopic(index, topic.query, null, 3) : [];
+    const addRanked = (items: RetrievedEvidence[], weight: number) => {
+      items.forEach((result, rank) => {
+        const key = `${result.citation.document_id}:${result.citation.chunk_id}`;
+        const contribution = weight / (60 + rank + 1);
+        const existing = merged.get(key);
+        if (existing) existing.score += contribution;
+        else merged.set(key, { ...result, score: contribution });
+      });
     }
+    // Reciprocal-rank fusion combines office-specific BM25 with a small
+    // cross-department safety net without letting broad matches dominate.
+    addRanked(scoped, 1);
+    addRanked(global, 0.65);
   }
   const results = [...merged.values()].sort((left, right) => right.score - left.score ||
     right.term_coverage - left.term_coverage).slice(0, 8);

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { evidenceStatus, loadPolicyIndex, searchPolicyIndex, type RetrievedEvidence } from "@/lib/policy-search";
-import { generateGroundedAnswerStream, GeminiError, hasValidCitationReferences } from "@/lib/gemini";
+import { evidenceStatus, loadPolicyIndex, routePolicyQuestion, searchPolicyIndex, type RetrievedEvidence } from "@/lib/policy-search";
+import { generateGroundedAnswerStream, GeminiError, hasValidCitationReferences, hasVerifiedEvidenceQuotes } from "@/lib/gemini";
 
 export const runtime = "nodejs";
 // 60 seconds is within Hobby's configured ceiling even when Fluid Compute is off.
@@ -89,6 +89,7 @@ function generationWarning(error: unknown): string {
   if (error.category === "gemini_request_failed" && error.httpStatus === 429) return "Gemini rate limit reached; retrieved passages are shown below.";
   if (error.category === "gemini_request_failed" && (error.httpStatus === 401 || error.httpStatus === 403)) return "Gemini authorization failed; retrieved passages are shown below.";
   if (error.category === "gemini_invalid_citation") return "Gemini returned a citation outside the supplied evidence; retrieved passages are shown below.";
+  if (error.category === "gemini_quote_unverified") return "Gemini's supporting quote could not be verified against the retrieved policy passage; retrieved passages are shown below.";
   return "Gemini generation failed; retrieved passages are shown below.";
 }
 
@@ -134,6 +135,7 @@ export async function POST(request: Request) {
   const query = priorQuestion && /\b(what about|how about|and the|when is it|those|that policy|it)\b/i.test(message)
     ? `${priorQuestion} ${message}`
     : message;
+  const routedTopics = routePolicyQuestion(query, typeof body.department === "string" ? body.department : null);
 
   let index;
   try {
@@ -167,7 +169,8 @@ export async function POST(request: Request) {
     message, status: "evidence_found", departments,
     citations, evidence, evidence_status: verified.status,
     requested_detail: verified.requested_detail,
-    retrieval_method: "keyword" as const,
+    retrieval_method: "keyword + routed BM25" as const,
+    topics: routedTopics.map((topic) => ({ department: topic.department, query: topic.query })),
   };
 
   // Keep the evidence-missing guard ahead of Gemini. Never ask the model to
@@ -194,6 +197,10 @@ export async function POST(request: Request) {
       void (async () => {
         let answer = "";
         let pendingCitation = "";
+        let quoteMode = false;
+        let outputBuffer = "";
+        let quoteBlock = "";
+        const quoteMarker = "<evidence_quotes>";
         const emitVerifiedText = (text: string) => {
           pendingCitation += text;
           while (pendingCitation) {
@@ -217,14 +224,46 @@ export async function POST(request: Request) {
             pendingCitation = pendingCitation.slice(close + 1);
           }
         };
+        const consumeModelText = (text: string) => {
+          if (quoteMode) {
+            quoteBlock += text;
+            return;
+          }
+          outputBuffer += text;
+          const markerAt = outputBuffer.indexOf(quoteMarker);
+          if (markerAt >= 0) {
+            const answerPart = outputBuffer.slice(0, markerAt);
+            answer += answerPart;
+            emitVerifiedText(answerPart);
+            quoteBlock = outputBuffer.slice(markerAt + quoteMarker.length).trim();
+            outputBuffer = "";
+            quoteMode = true;
+            return;
+          }
+          // Keep a possible split marker buffered across provider SSE chunks.
+          const safeLength = Math.max(0, outputBuffer.length - quoteMarker.length + 1);
+          if (safeLength) {
+            const safeText = outputBuffer.slice(0, safeLength);
+            outputBuffer = outputBuffer.slice(safeLength);
+            answer += safeText;
+            emitVerifiedText(safeText);
+          }
+        };
         try {
           for await (const token of generateGroundedAnswerStream(message, history, results, { signal: routeAbort.signal })) {
             if (cancelled) return;
-            answer += token;
-            emitVerifiedText(token);
+            consumeModelText(token);
+          }
+          if (!quoteMode && outputBuffer) {
+            answer += outputBuffer;
+            emitVerifiedText(outputBuffer);
+            outputBuffer = "";
           }
           if (pendingCitation || !hasValidCitationReferences(answer, Math.min(5, results.length))) {
             throw new GeminiError("gemini_invalid_citation");
+          }
+          if (!quoteMode || !hasVerifiedEvidenceQuotes(answer, quoteBlock, results)) {
+            throw new GeminiError("gemini_quote_unverified");
           }
           emit("done", { answer_mode: "gemini" });
         } catch (error) {

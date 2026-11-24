@@ -24,11 +24,39 @@ export function getGeminiTimeoutMs(value = process.env.YITI_GEMINI_TIMEOUT_MS): 
 
 export function hasValidCitationReferences(answer: string, evidenceCount: number): boolean {
   const suppliedSources = Math.min(5, evidenceCount);
+  let hasCitation = false;
   for (const match of answer.matchAll(/\[(\d+)\]/g)) {
+    hasCitation = true;
     const citationNumber = Number(match[1]);
     if (!Number.isInteger(citationNumber) || citationNumber < 1 || citationNumber > suppliedSources) return false;
   }
-  return true;
+  return hasCitation;
+}
+
+function normalizeQuote(value: string): string {
+  return value.normalize("NFKC").toLocaleLowerCase("en")
+    .replace(/[’‘]/g, "'")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
+/** Verifies each cited answer source has a verbatim quote from that passage. */
+export function hasVerifiedEvidenceQuotes(answer: string, quoteBlock: string, evidence: RetrievedEvidence[]): boolean {
+  if (!hasValidCitationReferences(answer, evidence.length)) return false;
+  const sourceNumbers = new Set([...answer.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1])));
+  const verifiedNumbers = new Set<number>();
+  const quoteLines = quoteBlock.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const line of quoteLines) {
+    const match = line.match(/^\[(\d+)\]\s+["“](.+?)["”]$/);
+    if (!match) return false;
+    const citationNumber = Number(match[1]);
+    if (!sourceNumbers.has(citationNumber) || citationNumber > Math.min(5, evidence.length)) return false;
+    const quote = normalizeQuote(match[2]);
+    const passage = normalizeQuote(evidence[citationNumber - 1]?.evidence ?? "");
+    if (quote.length < 24 || !passage.includes(quote)) return false;
+    verifiedNumbers.add(citationNumber);
+  }
+  return sourceNumbers.size > 0 && [...sourceNumbers].every((number) => verifiedNumbers.has(number));
 }
 
 type StreamOptions = {
@@ -61,7 +89,7 @@ function requestContents(
 
   return {
     systemInstruction: {
-      parts: [{ text: "You are Yiti AI, a Bennett University policy assistant. Answer only from the supplied retrieved policy passages. Do not use general knowledge to fill gaps or invent policies. If a requested time, amount, date, deadline, or duration is absent, say that the passage does not state it. For multi-topic questions, answer each supported topic separately. Use concise natural English and understand Hinglish. Add inline citations like [1] that refer only to the supplied passage numbers. Never claim a passage says more than it does." }],
+    parts: [{ text: "You are Yiti AI, a Bennett University policy assistant. Answer only from the supplied retrieved policy passages. Do not use general knowledge to fill gaps or invent policies. If a requested time, amount, date, deadline, or duration is absent, say that the passage does not state it. For multi-topic questions, answer each supported topic separately. Use concise natural English; reply in Hinglish when the student asks in Hinglish. Add inline citations like [1] that refer only to the supplied passage numbers. Never claim a passage says more than it does. After the answer, add a newline followed by the exact marker <evidence_quotes>. On following lines include one line for every citation used in your answer, in this exact format: [1] \"a verbatim quote of at least 24 characters copied exactly from passage 1\". Choose the shortest passage text that directly supports the answer. Do not place any other text after the quote lines." }],
     },
     contents,
     generationConfig: { temperature: 0, maxOutputTokens: 450 },
